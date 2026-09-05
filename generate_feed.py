@@ -4,81 +4,62 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import re
 
-import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from feedgen.feed import FeedGenerator
+from playwright.sync_api import sync_playwright
 
 
 BASE_URL = "https://www.r-pharm.com"
 NEWS_URL = "https://www.r-pharm.com/en/media-center/news"
 OUTPUT_FILE = Path("docs/feed.xml")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/128.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-MONTH_PATTERN = (
-    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
-    r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
-    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+MONTHS = (
+    r"January|February|March|April|May|June|July|August|"
+    r"September|October|November|December|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
 )
 
 DATE_PATTERNS = [
-    rf"\b\d{{1,2}}\s+{MONTH_PATTERN}\s+\d{{4}}\b",
-    rf"\b{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b",
+    rf"\b\d{{1,2}}\s+(?:{MONTHS})\s+\d{{4}}\b",
+    rf"\b(?:{MONTHS})\s+\d{{1,2}},?\s+\d{{4}}\b",
     r"\b\d{1,2}[./-]\d{1,2}[./-]\d{4}\b",
 ]
 
 
-def descargar_pagina(url):
-    respuesta = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=40,
-    )
-    respuesta.raise_for_status()
-    return respuesta.text
+def limpiar(texto):
+    return " ".join((texto or "").split()).strip()
 
 
-def es_enlace_noticia(url):
-    ruta = urlparse(url).path.rstrip("/")
-
+def es_noticia(url):
+    ruta = urlparse(url).path.rstrip("/").lower()
     prefijo = "/en/media-center/news/"
 
     return (
         ruta.startswith(prefijo)
         and ruta != "/en/media-center/news"
-        and len(ruta.split("/")) > 4
+        and len(ruta) > len(prefijo)
     )
 
 
-def limpiar_texto(texto):
-    return " ".join(texto.split()).strip()
+def encontrar_fecha(contenedor):
+    etiqueta_time = contenedor.find("time")
 
-
-def buscar_fecha(elemento):
-    time_element = elemento.find("time")
-
-    if time_element:
-        fecha = time_element.get("datetime") or time_element.get_text(
-            " ", strip=True
+    if etiqueta_time:
+        texto_fecha = (
+            etiqueta_time.get("datetime")
+            or etiqueta_time.get_text(" ", strip=True)
         )
 
         try:
-            return date_parser.parse(fecha, fuzzy=True)
+            return date_parser.parse(texto_fecha, fuzzy=True)
         except (ValueError, TypeError, OverflowError):
             pass
 
-    texto = limpiar_texto(elemento.get_text(" ", strip=True))
+    texto = limpiar(contenedor.get_text(" ", strip=True))
 
     for patron in DATE_PATTERNS:
-        coincidencia = re.search(patron, texto, flags=re.IGNORECASE)
+        coincidencia = re.search(patron, texto, re.IGNORECASE)
 
         if coincidencia:
             try:
@@ -93,79 +74,125 @@ def buscar_fecha(elemento):
     return None
 
 
-def buscar_descripcion(elemento, titulo):
-    parrafos = elemento.find_all(["p", "div", "span"])
-
-    for parrafo in parrafos:
-        texto = limpiar_texto(parrafo.get_text(" ", strip=True))
+def encontrar_descripcion(contenedor, titulo):
+    for elemento in contenedor.find_all(["p", "div", "span"]):
+        texto = limpiar(elemento.get_text(" ", strip=True))
 
         if (
             texto
             and texto != titulo
-            and len(texto) >= 35
-            and len(texto) <= 600
-            and not any(
-                re.fullmatch(patron, texto, flags=re.IGNORECASE)
-                for patron in DATE_PATTERNS
-            )
+            and 40 <= len(texto) <= 500
+            and titulo.lower() not in texto.lower()
         ):
             return texto
 
     return ""
 
 
-def obtener_noticias():
-    año_actual = datetime.now(timezone.utc).year
+def descargar_paginas():
+    año = datetime.now(timezone.utc).year
 
-    paginas = [
+    urls = [
         NEWS_URL,
-        f"{NEWS_URL}?year={año_actual}",
-        f"{NEWS_URL}?year={año_actual - 1}",
-        f"{NEWS_URL}?year={año_actual - 2}",
+        f"{NEWS_URL}?year={año}",
+        f"{NEWS_URL}?year={año - 1}",
+        f"{NEWS_URL}?year={año - 2}",
+        f"{NEWS_URL}?year={año - 3}",
     ]
 
+    paginas = []
+
+    with sync_playwright() as playwright:
+        navegador = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        contexto = navegador.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            viewport={"width": 1440, "height": 1200},
+        )
+
+        pagina = contexto.new_page()
+
+        for url in urls:
+            print(f"Abriendo: {url}")
+
+            try:
+                pagina.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=90000,
+                )
+
+                pagina.wait_for_timeout(7000)
+
+                # Desplazamiento para activar contenido de carga diferida.
+                for _ in range(5):
+                    pagina.mouse.wheel(0, 1500)
+                    pagina.wait_for_timeout(1000)
+
+                paginas.append(pagina.content())
+
+                print(
+                    f"Enlaces encontrados en la página: "
+                    f"{pagina.locator('a').count()}"
+                )
+
+            except Exception as error:
+                print(f"No se pudo abrir {url}: {error}")
+
+        navegador.close()
+
+    return paginas
+
+
+def obtener_noticias():
+    paginas = descargar_paginas()
     noticias = {}
-    errores = []
 
-    for pagina in paginas:
-        try:
-            html = descargar_pagina(pagina)
-        except requests.RequestException as error:
-            errores.append(f"{pagina}: {error}")
-            continue
-
+    for html in paginas:
         soup = BeautifulSoup(html, "html.parser")
 
         for enlace in soup.find_all("a", href=True):
-            url = urljoin(BASE_URL, enlace["href"])
+            url = urljoin(BASE_URL, enlace.get("href", ""))
 
-            if not es_enlace_noticia(url):
+            if not es_noticia(url):
                 continue
 
-            titulo = limpiar_texto(enlace.get_text(" ", strip=True))
+            titulo = limpiar(enlace.get_text(" ", strip=True))
 
             if len(titulo) < 5:
                 imagen = enlace.find("img")
-                titulo = limpiar_texto(
-                    imagen.get("alt", "") if imagen else ""
-                )
+
+                if imagen:
+                    titulo = limpiar(imagen.get("alt", ""))
 
             if len(titulo) < 5:
                 continue
 
             contenedor = enlace
 
-            for _ in range(4):
-                if contenedor.parent is None:
+            for _ in range(5):
+                if not contenedor.parent:
                     break
 
                 contenedor = contenedor.parent
 
-                if contenedor.name in ["article", "li"]:
+                if contenedor.name in ("article", "li"):
                     break
 
-            fecha = buscar_fecha(contenedor)
-            descripcion = buscar_descripcion(contenedor, titulo)
+            fecha = encontrar_fecha(contenedor)
+            descripcion = encontrar_descripcion(contenedor, titulo)
 
             noticias[url] = {
                 "titulo": titulo,
@@ -175,25 +202,26 @@ def obtener_noticias():
             }
 
     if not noticias:
-        detalle = "\n".join(errores)
-
         raise RuntimeError(
-            "No se encontraron noticias de R-Pharm. "
-            "La RSS anterior no será eliminada.\n"
-            f"{detalle}"
+            "R-Pharm no mostró enlaces de noticias después de cargar "
+            "la página con Chromium. La RSS anterior no será eliminada."
         )
 
-    fecha_minima = datetime(1970, 1, 1)
+    fecha_antigua = datetime(1970, 1, 1)
 
-    return sorted(
+    resultado = sorted(
         noticias.values(),
         key=lambda noticia: (
             noticia["fecha"].replace(tzinfo=None)
             if noticia["fecha"]
-            else fecha_minima
+            else fecha_antigua
         ),
         reverse=True,
     )
+
+    print(f"Noticias encontradas: {len(resultado)}")
+
+    return resultado
 
 
 def crear_rss(noticias):
@@ -201,6 +229,10 @@ def crear_rss(noticias):
 
     feed.id(NEWS_URL)
     feed.title("R-Pharm – News")
+    feed.description(
+        "Latest news and announcements from R-Pharm"
+    )
+    feed.language("en")
     feed.link(href=NEWS_URL, rel="alternate")
     feed.link(
         href=(
@@ -209,10 +241,6 @@ def crear_rss(noticias):
         ),
         rel="self",
     )
-    feed.description(
-        "Latest news and announcements from R-Pharm"
-    )
-    feed.language("en")
     feed.lastBuildDate(datetime.now(timezone.utc))
 
     for noticia in noticias[:100]:
@@ -222,13 +250,10 @@ def crear_rss(noticias):
         entrada.title(noticia["titulo"])
         entrada.link(href=noticia["url"])
 
-        descripcion = (
+        entrada.description(
             noticia["descripcion"]
-            or f"Read the complete announcement on R-Pharm: "
-               f"{noticia['titulo']}"
+            or f"Read the complete announcement: {noticia['titulo']}"
         )
-
-        entrada.description(descripcion)
 
         if noticia["fecha"]:
             fecha = noticia["fecha"]
@@ -247,7 +272,6 @@ def crear_rss(noticias):
     )
 
     print(f"RSS creada correctamente: {OUTPUT_FILE}")
-    print(f"Número de noticias: {len(noticias)}")
 
 
 if __name__ == "__main__":
