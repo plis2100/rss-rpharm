@@ -16,7 +16,7 @@ concurrency:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Descargar repositorio
@@ -45,13 +45,26 @@ jobs:
 
       - name: Instalar dependencias
         if: github.event_name == 'workflow_dispatch' || steps.horario.outputs.ejecutar == 'true'
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests==2.32.3 beautifulsoup4==4.12.3 feedgen==1.0.0 python-dateutil==2.9.0.post0
+          python -m pip install --no-cache-dir \
+            beautifulsoup4==4.12.3 \
+            feedgen==1.0.0 \
+            python-dateutil==2.9.0.post0 \
+            playwright==1.55.0
+
+          python -m playwright install --with-deps chromium
+
+          python -c "from playwright.sync_api import sync_playwright; print('Playwright instalado correctamente')"
 
       - name: Crear RSS
         if: github.event_name == 'workflow_dispatch' || steps.horario.outputs.ejecutar == 'true'
-        run: python generate_feed.py
+        shell: bash
+        run: |
+          python -m pip install --no-cache-dir playwright==1.55.0
+          python -c "from playwright.sync_api import sync_playwright; print('Playwright disponible')"
+          python generate_feed.py
 
       - name: Guardar RSS
         if: github.event_name == 'workflow_dispatch' || steps.horario.outputs.ejecutar == 'true'
